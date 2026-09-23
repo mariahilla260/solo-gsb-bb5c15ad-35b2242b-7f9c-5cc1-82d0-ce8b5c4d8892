@@ -28,6 +28,11 @@
   - 支持深度与展开节点数上限，防止病态查询耗尽资源。
 - **指纹缓存**：对（schema、query、variables、budget、operation、选项、成本模型版本）
   做规范化 SHA-256 指纹，结果持久化在 SQLite，支持命中计数、列表、详情与删除。
+- **Schema 兼容性检查**（`POST /v1/schema-compatibility`）：对比基线与候选 SDL，
+  从既有客户端视角判断候选 schema 是否可平滑升级：同名字段的命名类型与列表层级必须
+  保持不变；返回类型只允许**加强**非空约束（`String` → `String!`），字段参数只允许
+  **放宽**非空约束（`Int!` → `Int`）；报告被移除字段、新增的无默认值必填参数，以及
+  每条违规的类型路径与原因。
 
 ## 快速开始（Docker Compose）
 
@@ -117,6 +122,74 @@ curl -X POST http://localhost:8000/v1/analyze \
 - `errors[]` / `warnings[]`：错误码（如 `FRAGMENT_CYCLE`、`VALIDATION_FAILED`、
   `MAX_DEPTH_EXCEEDED`、`AMBIGUOUS_OPERATION`）与行列位置。
 
+### `POST /v1/schema-compatibility` — Schema 兼容性检查
+
+接收客户端当前使用的**基线 SDL** 与待发布的**候选 SDL**，判断既有 GraphQL 客户端
+能否不改代码继续使用候选 schema。该接口不访问缓存，直接同步返回报告。
+
+```bash
+curl -X POST http://localhost:8000/v1/schema-compatibility \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "baseline_sdl": "type Query { users(limit: Int): [User!]! } type User { id: ID! name: String }",
+    "candidate_sdl": "type Query { users(limit: Int, after: ID): [User!] } type User { id: ID! name: String! }"
+  }'
+```
+
+兼容性规则（对基线与候选中同名、同所属类型的字段）：
+
+| 维度 | 允许的变更 | 违规 code |
+| --- | --- | --- |
+| 命名字段类型 | 必须不变（`User` 不能变 `Account`） | `FIELD_NAMED_TYPE_CHANGED` |
+| 返回类型列表层级 | 嵌套层数与每层的列表位置必须不变 | `FIELD_LIST_DEPTH_CHANGED` |
+| 返回类型非空 | 只允许**加强**：`String` → `String!`、`[T]` → `[T!]!`；去掉 `!` 是破坏性变更 | `FIELD_NULLABILITY_WEAKENED` |
+| 参数命名类型 | 必须不变 | `ARGUMENT_NAMED_TYPE_CHANGED` |
+| 参数列表层级 | 必须不变 | `ARGUMENT_LIST_DEPTH_CHANGED` |
+| 参数非空 | 只允许**放宽**：`Int!` → `Int`；新增 `!` 会拒绝旧请求 | `ARGUMENT_NULLABILITY_STRENGTHENED` |
+| 新增参数 | 可空或带默认值即可；非空且无默认值要求每个旧调用补参 | 列入 `added_required_arguments` |
+| 删除字段 | 旧查询在候选 schema 上校验失败 | 列入 `removed_fields` |
+
+响应示例（对应一个会破坏旧客户端的候选 schema）：
+
+```json
+{
+  "compatible": false,
+  "removed_fields": [
+    {"path": "User.name", "type": "String"}
+  ],
+  "added_required_arguments": [
+    {"path": "Query.users(after)", "field": "Query.users", "argument": "after", "type": "ID!"}
+  ],
+  "violations": [
+    {
+      "code": "FIELD_NULLABILITY_WEAKENED",
+      "path": "Query.users",
+      "reason": "Non-null constraint on the list was removed ('[User!]!' -> '[User!]'); clients may now receive null where the baseline promised a value.",
+      "baseline_type": "[User!]!",
+      "candidate_type": "[User!]"
+    },
+    {
+      "code": "ARGUMENT_NULLABILITY_STRENGTHENED",
+      "path": "Query.users(limit)",
+      "reason": "Argument type 'Int' became non-null ('Int' -> 'Int!'); existing requests that omit this value may be rejected.",
+      "baseline_type": "Int",
+      "candidate_type": "Int!"
+    }
+  ],
+  "errors": []
+}
+```
+
+说明：
+
+- `compatible` 为 `true` 当且仅当三个报告列表均为空。
+- `path` 为类型路径：字段是 `Type.field`，参数是 `Type.field(argument)`。
+- 新增字段、新增类型、新增可空/带默认值参数等纯增量变更不产生任何条目。
+- 类型被整体删除或类型种类改变（object → scalar 等）时，其基线字段会逐个出现在
+  `removed_fields` 中。
+- 任一侧 SDL 语法错误不会返回 5xx：HTTP 状态码仍为 200，`compatible=false`，
+  错误放在 `errors[]`（`details.side` 标明是 `baseline` 还是 `candidate`）。
+
 ### 缓存管理
 
 ```bash
@@ -192,12 +265,13 @@ pytest
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由（analyze / analyses / config / healthz）
-│   ├── analyzer.py    # 核心：片段展开、循环检测、乘数解析、逐路径成本计算、指纹
+│   ├── main.py          # FastAPI 路由（analyze / schema-compatibility / analyses / config / healthz）
+│   ├── analyzer.py      # 核心：片段展开、循环检测、乘数解析、逐路径成本计算、指纹
+│   ├── compatibility.py # 基线/候选 SDL 兼容性检查（字段移除、必填参数、类型/非空规则）
 │   ├── db.py          # SQLite 持久化（WAL，线程安全）
 │   ├── models.py      # Pydantic 请求/响应模型
 │   └── config.py      # COSTGUARD_* 环境变量配置
-├── tests/             # pytest：分析器 27 例 + API 8 例
+├── tests/             # pytest：分析器 27 例 + 兼容性 37 例 + API 12 例
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

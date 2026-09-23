@@ -133,3 +133,55 @@ class AnalysisDetailResponse(BaseModel):
     summary: AnalysisSummary
     request: dict[str, Any]
     result: AnalyzeResponse
+
+
+# --------------------------------------------------------------------------- #
+# Schema compatibility
+# --------------------------------------------------------------------------- #
+
+
+class SchemaCompatibilityRequest(BaseModel):
+    baseline_sdl: str = Field(
+        ..., min_length=1, description="SDL of the schema clients currently use"
+    )
+    candidate_sdl: str = Field(
+        ..., min_length=1, description="SDL of the proposed new schema"
+    )
+
+
+class RemovedField(BaseModel):
+    path: str = Field(..., description="Type.field path of the removed field")
+    type: str = Field(..., description="Return type the field had in the baseline")
+
+
+class AddedRequiredArgument(BaseModel):
+    path: str = Field(..., description="Type.field(argument) path")
+    field: str = Field(..., description="Type.field path of the parent field")
+    argument: str = Field(..., description="Name of the new required argument")
+    type: str = Field(..., description="Non-null type of the new argument")
+
+
+class CompatibilityViolation(BaseModel):
+    code: Literal[
+        "FIELD_NAMED_TYPE_CHANGED",
+        "FIELD_LIST_DEPTH_CHANGED",
+        "FIELD_NULLABILITY_WEAKENED",
+        "ARGUMENT_NAMED_TYPE_CHANGED",
+        "ARGUMENT_LIST_DEPTH_CHANGED",
+        "ARGUMENT_NULLABILITY_STRENGTHENED",
+    ]
+    path: str = Field(..., description="Type.field or Type.field(argument) path")
+    reason: str = Field(..., description="Why the change breaks existing clients")
+    baseline_type: str
+    candidate_type: str
+
+
+class SchemaCompatibilityResponse(BaseModel):
+    compatible: bool = Field(
+        ...,
+        description="True when no breaking change for existing clients was found",
+    )
+    removed_fields: list[RemovedField]
+    added_required_arguments: list[AddedRequiredArgument]
+    violations: list[CompatibilityViolation]
+    errors: list[ErrorDetail]

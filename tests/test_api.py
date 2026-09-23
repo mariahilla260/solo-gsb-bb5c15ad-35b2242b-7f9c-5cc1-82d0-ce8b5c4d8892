@@ -146,3 +146,73 @@ def test_cache_hit_increments_hit_count(client):
     detail = client.get(f"/v1/analyses/{fingerprint}").json()
     # Two additional analyze calls + one detail fetch after creation
     assert detail["summary"]["hit_count"] == 3
+
+
+def test_schema_compatibility_compatible_change(client):
+    body = client.post(
+        "/v1/schema-compatibility",
+        json={
+            "baseline_sdl": "type Query { user(id: ID!): User } type User { name: String }",
+            "candidate_sdl": (
+                "type Query { user(id: ID!): User, active: Boolean } "
+                "type User { name: String! email: String }"
+            ),
+        },
+    ).json()
+    assert body["compatible"] is True
+    assert body["removed_fields"] == []
+    assert body["added_required_arguments"] == []
+    assert body["violations"] == []
+    assert body["errors"] == []
+
+
+def test_schema_compatibility_reports_breaking_changes(client):
+    response = client.post(
+        "/v1/schema-compatibility",
+        json={
+            "baseline_sdl": (
+                "type Query { user(id: ID!): User } "
+                "type User { id: ID! name: String friends: [User!]! }"
+            ),
+            "candidate_sdl": (
+                "type Query { user(id: ID!, tenant: String!): Account } "
+                "type Account { id: ID! } type User { id: ID }"
+            ),
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["compatible"] is False
+    assert {f["path"] for f in body["removed_fields"]} == {
+        "User.name",
+        "User.friends",
+    }
+    assert {a["path"] for a in body["added_required_arguments"]} == {
+        "Query.user(tenant)"
+    }
+    violations = {v["path"]: v["code"] for v in body["violations"]}
+    assert violations["Query.user"] == "FIELD_NAMED_TYPE_CHANGED"
+    assert violations["User.id"] == "FIELD_NULLABILITY_WEAKENED"
+
+
+def test_schema_compatibility_invalid_sdl_still_200(client):
+    body = client.post(
+        "/v1/schema-compatibility",
+        json={"baseline_sdl": "type Query { f: Int }", "candidate_sdl": "type Query {"},
+    ).json()
+    assert body["compatible"] is False
+    assert body["errors"][0]["details"]["side"] == "candidate"
+    assert body["errors"][0]["code"] == "GRAPHQL_ERROR"
+
+
+def test_schema_compatibility_requires_both_sdl(client):
+    missing = client.post(
+        "/v1/schema-compatibility", json={"baseline_sdl": "type Query { f: Int }"}
+    )
+    assert missing.status_code == 422
+
+    blank = client.post(
+        "/v1/schema-compatibility",
+        json={"baseline_sdl": "", "candidate_sdl": "type Query { f: Int }"},
+    )
+    assert blank.status_code == 422
