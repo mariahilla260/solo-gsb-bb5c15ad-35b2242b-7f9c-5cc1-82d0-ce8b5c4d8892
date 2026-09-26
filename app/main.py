@@ -9,6 +9,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
 from . import __version__
 from .analyzer import AnalyzerConfig, analyze_query, compute_fingerprint
+from .compatibility import check_schema_compatibility
 from .config import get_settings
 from .db import AnalysisStore
 from .models import (
@@ -17,6 +18,8 @@ from .models import (
     AnalysisSummary,
     AnalyzeRequest,
     AnalyzeResponse,
+    SchemaCompatibilityRequest,
+    SchemaCompatibilityResponse,
 )
 
 logger = logging.getLogger("costguard")
@@ -203,3 +206,24 @@ def delete_analysis(
             status_code=404,
             detail=f"analysis '{fingerprint}' not found",
         )
+
+
+# --------------------------------------------------------------------------- #
+# Schema compatibility endpoint
+# --------------------------------------------------------------------------- #
+
+
+@app.post(
+    "/v1/schema-compatibility",
+    response_model=SchemaCompatibilityResponse,
+    tags=["compatibility"],
+    summary="Check whether existing clients tolerate a candidate schema",
+)
+def schema_compatibility(
+    request_body: SchemaCompatibilityRequest,
+) -> SchemaCompatibilityResponse:
+    result = check_schema_compatibility(
+        baseline_sdl=request_body.baseline_sdl,
+        candidate_sdl=request_body.candidate_sdl,
+    )
+    return SchemaCompatibilityResponse(**result)

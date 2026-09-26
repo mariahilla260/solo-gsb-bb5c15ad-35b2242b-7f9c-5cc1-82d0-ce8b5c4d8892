@@ -146,3 +146,81 @@ def test_cache_hit_increments_hit_count(client):
     detail = client.get(f"/v1/analyses/{fingerprint}").json()
     # Two additional analyze calls + one detail fetch after creation
     assert detail["summary"]["hit_count"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# Schema compatibility
+# --------------------------------------------------------------------------- #
+
+
+BASELINE_SDL = (
+    "type Query { user(id: ID!): User users(first: Int): [User!]! } "
+    "type User { id: ID! name: String email: String! }"
+)
+
+
+def compatibility_payload(**overrides) -> dict:
+    payload = {"baseline_sdl": BASELINE_SDL, "candidate_sdl": BASELINE_SDL}
+    payload.update(overrides)
+    return payload
+
+
+def test_schema_compatibility_compatible(client):
+    candidate = (
+        "type Query { user(id: ID!): User! "
+        "users(first: Int, limit: Int = 10): [User!]! } "
+        "type User { id: ID! name: String! email: String! nickname: String }"
+    )
+    response = client.post(
+        "/v1/schema-compatibility",
+        json=compatibility_payload(candidate_sdl=candidate),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["compatible"] is True
+    assert body["violations"] == []
+    assert body["summary"]["checked_type_count"] == 2
+
+
+def test_schema_compatibility_reports_violations(client):
+    candidate = (
+        "type Query { user(id: ID!): String "
+        "users(first: Int, filter: String!): [User!]! } "
+        "type User { id: ID! name: String }"
+    )
+    response = client.post(
+        "/v1/schema-compatibility",
+        json=compatibility_payload(candidate_sdl=candidate),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "incompatible"
+    assert body["compatible"] is False
+    by_path = {v["path"]: v["code"] for v in body["violations"]}
+    assert by_path["Query.user"] == "RETURN_NAMED_TYPE_CHANGED"
+    assert by_path["Query.users(filter)"] == "REQUIRED_ARGUMENT_ADDED"
+    assert by_path["User.email"] == "FIELD_REMOVED"
+    assert body["summary"]["removed_field_count"] == 1
+    assert body["summary"]["required_argument_count"] == 1
+    assert body["summary"]["type_violation_count"] == 1
+
+
+def test_schema_compatibility_invalid_sdl(client):
+    response = client.post(
+        "/v1/schema-compatibility",
+        json=compatibility_payload(candidate_sdl="type Query {"),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "invalid"
+    assert body["compatible"] is False
+    assert body["summary"] is None
+    assert body["errors"][0]["code"] == "INVALID_CANDIDATE_SDL"
+
+
+def test_schema_compatibility_requires_both_sdls(client):
+    response = client.post(
+        "/v1/schema-compatibility", json={"baseline_sdl": BASELINE_SDL}
+    )
+    assert response.status_code == 422

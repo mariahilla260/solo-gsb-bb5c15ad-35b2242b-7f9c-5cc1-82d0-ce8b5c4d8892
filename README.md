@@ -28,6 +28,10 @@
   - 支持深度与展开节点数上限，防止病态查询耗尽资源。
 - **指纹缓存**：对（schema、query、variables、budget、operation、选项、成本模型版本）
   做规范化 SHA-256 指纹，结果持久化在 SQLite，支持命中计数、列表、详情与删除。
+- **Schema 兼容性检查**：`POST /v1/schema-compatibility` 对比基线与候选 SDL，
+  判断既有客户端能否继续使用候选 schema——同名字段的命名类型与列表层级须保持不变，
+  返回类型仅可加强非空约束、参数类型仅可放宽非空约束；报告被移除字段、
+  新增无默认值的必填参数及违反规则的类型路径与原因。
 
 ## 快速开始（Docker Compose）
 
@@ -117,6 +121,93 @@ curl -X POST http://localhost:8000/v1/analyze \
 - `errors[]` / `warnings[]`：错误码（如 `FRAGMENT_CYCLE`、`VALIDATION_FAILED`、
   `MAX_DEPTH_EXCEEDED`、`AMBIGUOUS_OPERATION`）与行列位置。
 
+### `POST /v1/schema-compatibility` — Schema 兼容性检查
+
+接收基线（当前线上）与候选两份 SDL，检查既有 GraphQL 客户端能否在候选 schema 上
+继续工作。判定规则：
+
+- 基线中每个 object / interface 字段在候选中必须仍然存在；
+- 同名字段的**命名类型**与**列表层级**必须保持不变；
+- **返回类型**只允许加强非空约束（`String` → `String!` 安全，反之破坏性）；
+- **参数类型**只允许放宽非空约束（`Int!` → `Int` 安全，反之破坏性）；
+- 新增参数必须是可选的（可空，或声明了默认值）；
+- 新增字段 / 类型、删除不再使用的参数不影响兼容性。
+
+```bash
+curl -X POST http://localhost:8000/v1/schema-compatibility \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "baseline_sdl": "type Query { user(id: ID!): User } type User { id: ID! name: String email: String! }",
+    "candidate_sdl": "type Query { user(id: ID!): User! } type User { id: ID! name: String! nickname: String }"
+  }'
+```
+
+请求字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `baseline_sdl` | string，必填 | 基线（当前部署）GraphQL SDL |
+| `candidate_sdl` | string，必填 | 待校验的候选 GraphQL SDL |
+
+响应关键字段：
+
+- `status`：`ok`（完全兼容）/ `incompatible`（存在破坏性变更）/ `invalid`（SDL 语法错误）。
+- `compatible`：是否兼容（`invalid` 时为 `false`）。
+- `summary`：`violation_count`、`removed_field_count`、`required_argument_count`、
+  `type_violation_count` 以及 `checked_type_count` / `checked_field_count`。
+- `violations[]`：每项含 `code`、`path`（如 `User.email`、`Query.user(id)`）、
+  `reason` 与 `details`（含变更前后的类型字符串及非空约束位置，位置从命名类型起从 0 计数）。
+- `errors[]`：SDL 解析错误，码为 `INVALID_BASELINE_SDL` / `INVALID_CANDIDATE_SDL`，含行列位置。
+
+`violations[].code` 取值：
+
+| code | 含义 |
+| --- | --- |
+| `FIELD_REMOVED` | 基线字段在候选中被移除（或所属类型被移除） |
+| `RETURN_NAMED_TYPE_CHANGED` | 返回类型的命名类型改变 |
+| `RETURN_LIST_DEPTH_CHANGED` | 返回类型的列表嵌套层级改变 |
+| `RETURN_NULLABILITY_WEAKENED` | 返回类型放宽了非空约束（仅允许加强） |
+| `ARGUMENT_NAMED_TYPE_CHANGED` | 参数的命名类型改变 |
+| `ARGUMENT_LIST_DEPTH_CHANGED` | 参数的列表嵌套层级改变 |
+| `ARGUMENT_NULLABILITY_STRENGTHENED` | 参数加强了非空约束（仅允许放宽） |
+| `REQUIRED_ARGUMENT_ADDED` | 新增了无默认值的必填（非空）参数 |
+
+不兼容的响应示例（节选）：
+
+```json
+{
+  "status": "incompatible",
+  "compatible": false,
+  "summary": {
+    "compatible": false,
+    "violation_count": 3,
+    "removed_field_count": 1,
+    "required_argument_count": 1,
+    "type_violation_count": 1
+  },
+  "violations": [
+    {
+      "code": "RETURN_NAMED_TYPE_CHANGED",
+      "path": "Query.user",
+      "reason": "Return type of 'Query.user' changed its named type from 'User' to 'Account'; the named type must stay the same.",
+      "details": {"baseline_type": "User", "candidate_type": "Account"}
+    },
+    {
+      "code": "REQUIRED_ARGUMENT_ADDED",
+      "path": "Query.users(filter)",
+      "reason": "Argument 'Query.users(filter)' was added as a required argument (type 'String!' with no default value); existing client calls would fail validation.",
+      "details": {"argument_type": "String!"}
+    },
+    {
+      "code": "FIELD_REMOVED",
+      "path": "User.email",
+      "reason": "Field 'User.email' exists in the baseline schema but is missing from the candidate; clients selecting it would break.",
+      "details": null
+    }
+  ]
+}
+```
+
 ### 缓存管理
 
 ```bash
@@ -192,12 +283,13 @@ pytest
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由（analyze / analyses / config / healthz）
-│   ├── analyzer.py    # 核心：片段展开、循环检测、乘数解析、逐路径成本计算、指纹
+│   ├── main.py          # FastAPI 路由（analyze / analyses / schema-compatibility / config / healthz）
+│   ├── analyzer.py      # 核心：片段展开、循环检测、乘数解析、逐路径成本计算、指纹
+│   ├── compatibility.py # 核心：基线 vs 候选 SDL 的客户端兼容性比对
 │   ├── db.py          # SQLite 持久化（WAL，线程安全）
 │   ├── models.py      # Pydantic 请求/响应模型
 │   └── config.py      # COSTGUARD_* 环境变量配置
-├── tests/             # pytest：分析器 27 例 + API 8 例
+├── tests/             # pytest：分析器 26 例 + 兼容性 24 例 + API 13 例
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

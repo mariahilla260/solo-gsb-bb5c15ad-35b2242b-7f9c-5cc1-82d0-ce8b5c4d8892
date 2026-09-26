@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 AnalysisStatus = Literal["ok", "over_budget", "invalid", "error"]
+CompatibilityStatus = Literal["ok", "incompatible", "invalid"]
 
 
 class AnalysisOptions(BaseModel):
@@ -133,3 +134,59 @@ class AnalysisDetailResponse(BaseModel):
     summary: AnalysisSummary
     request: dict[str, Any]
     result: AnalyzeResponse
+
+
+# --------------------------------------------------------------------------- #
+# Schema compatibility
+# --------------------------------------------------------------------------- #
+
+
+class SchemaCompatibilityRequest(BaseModel):
+    baseline_sdl: str = Field(
+        ..., min_length=1, description="Baseline (currently deployed) GraphQL SDL"
+    )
+    candidate_sdl: str = Field(
+        ..., min_length=1, description="Candidate GraphQL SDL to validate"
+    )
+
+
+class CompatibilityViolation(BaseModel):
+    code: Literal[
+        "FIELD_REMOVED",
+        "RETURN_NAMED_TYPE_CHANGED",
+        "RETURN_LIST_DEPTH_CHANGED",
+        "RETURN_NULLABILITY_WEAKENED",
+        "ARGUMENT_NAMED_TYPE_CHANGED",
+        "ARGUMENT_LIST_DEPTH_CHANGED",
+        "ARGUMENT_NULLABILITY_STRENGTHENED",
+        "REQUIRED_ARGUMENT_ADDED",
+    ]
+    path: str = Field(
+        ...,
+        description="Type path, e.g. 'User.email' or 'Query.user(id)'",
+    )
+    reason: str
+    details: dict[str, Any] | None = None
+
+
+class CompatibilitySummary(BaseModel):
+    compatible: bool
+    violation_count: int
+    removed_field_count: int
+    required_argument_count: int
+    type_violation_count: int
+    checked_type_count: int
+    checked_field_count: int
+
+
+class CompatibilityMeta(BaseModel):
+    analysis_ms: float
+
+
+class SchemaCompatibilityResponse(BaseModel):
+    status: CompatibilityStatus
+    compatible: bool
+    summary: CompatibilitySummary | None
+    violations: list[CompatibilityViolation]
+    errors: list[ErrorDetail]
+    meta: CompatibilityMeta
